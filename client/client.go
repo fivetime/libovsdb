@@ -159,7 +159,9 @@ func newOVSDBClient(clientDBModel model.ClientDBModel, opts ...Option) (*ovsdbCl
 		},
 		errorCh:         make(chan error),
 		handlerShutdown: &sync.WaitGroup{},
-		disconnect:      make(chan struct{}),
+		// Buffered so that the notification is kept for a caller that is not
+		// receiving at the moment the connection drops.
+		disconnect: make(chan struct{}, 1),
 	}
 	var err error
 	ovs.options, err = newOptions(opts...)
@@ -321,6 +323,12 @@ func (o *ovsdbClient) connect(ctx context.Context, reconnect bool) error {
 			db.cache.Run(o.stopCh)
 			close(eventStopChan)
 		}(db)
+	}
+	// A notification left over from a previous connection that nobody
+	// received does not concern this one.
+	select {
+	case <-o.disconnect:
+	default:
 	}
 	// Start watching for disconnection only once every handler it waits for
 	// has been added: the server may close the connection at any time.
@@ -601,7 +609,9 @@ func (o *ovsdbClient) CurrentEndpoint() string {
 }
 
 // DisconnectNotify returns a channel which will notify the caller when the
-// server has disconnected
+// server has disconnected. The notification is kept until it is received,
+// and a notification nobody received is dropped when the client connects
+// again.
 func (o *ovsdbClient) DisconnectNotify() chan struct{} {
 	return o.disconnect
 }

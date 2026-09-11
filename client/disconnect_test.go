@@ -85,3 +85,40 @@ func TestConnectedIsFalseAfterServerClosesConnection(t *testing.T) {
 	_, err := ovs.Transact(context.Background(), commentOperation())
 	require.ErrorIs(t, err, ErrNotConnected)
 }
+
+// waitDisconnected waits until the client saw the server close its
+// connection and had time to send the disconnect notification.
+func waitDisconnected(t *testing.T, ovs *ovsdbClient) {
+	t.Helper()
+	require.Eventually(t, func() bool {
+		return !ovs.Connected()
+	}, 5*time.Second, 10*time.Millisecond)
+	// The notification is sent after the connection state is cleared.
+	time.Sleep(200 * time.Millisecond)
+}
+
+// The disconnect notification must reach a caller that was not receiving at
+// the moment the connection dropped, and must not be left pending on a later
+// connection.
+func TestDisconnectNotificationIsKeptUntilReceived(t *testing.T) {
+	_, sock, conns := newServerWithConnections(t)
+	ovs := connectServerDBClient(t, sock)
+
+	nextServerConnection(t, conns).Close()
+	waitDisconnected(t, ovs)
+	select {
+	case <-ovs.DisconnectNotify():
+	case <-time.After(5 * time.Second):
+		t.Fatal("the disconnect notification was dropped because nobody was receiving")
+	}
+
+	require.NoError(t, ovs.Connect(context.Background()))
+	nextServerConnection(t, conns).Close()
+	waitDisconnected(t, ovs)
+	require.NoError(t, ovs.Connect(context.Background()))
+	select {
+	case <-ovs.DisconnectNotify():
+		t.Fatal("the notification of the previous connection is pending on the new one")
+	default:
+	}
+}
