@@ -64,3 +64,24 @@ func TestServerClosingConnectionTearsDownClient(t *testing.T) {
 		return ovs.rpcClient == nil
 	}, 5*time.Second, 10*time.Millisecond)
 }
+
+func commentOperation() ovsdb.Operation {
+	comment := "libovsdb test"
+	return ovsdb.Operation{Op: ovsdb.OperationComment, Comment: &comment}
+}
+
+// Connected must not keep reporting true once the server closed the
+// connection: every call fails with ErrNotConnected from then on.
+func TestConnectedIsFalseAfterServerClosesConnection(t *testing.T) {
+	_, sock, conns := newServerWithConnections(t)
+	ovs := connectServerDBClient(t, sock)
+	require.True(t, ovs.Connected())
+
+	nextServerConnection(t, conns).Close()
+
+	require.Eventually(t, func() bool {
+		return !ovs.Connected()
+	}, 5*time.Second, 10*time.Millisecond, "Connected() still true after the server closed the connection")
+	_, err := ovs.Transact(context.Background(), commentOperation())
+	require.ErrorIs(t, err, ErrNotConnected)
+}

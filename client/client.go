@@ -1263,6 +1263,7 @@ func (o *ovsdbClient) handleDisconnectNotification() {
 	o.trafficSeen = nil
 	if o.options.reconnect && !o.isShutdown() {
 		o.rpcClient = nil
+		o.connected = false
 		o.rpcMutex.Unlock()
 		suppressionCounter := 1
 		connect := func() error {
@@ -1300,6 +1301,7 @@ func (o *ovsdbClient) handleDisconnectNotification() {
 
 	// clear connection state
 	o.rpcClient = nil
+	o.connected = false
 	o.rpcMutex.Unlock()
 
 	for _, db := range o.databases {
