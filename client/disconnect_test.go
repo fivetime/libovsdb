@@ -1,0 +1,66 @@
+package client
+
+import (
+	"context"
+	"encoding/json"
+	"testing"
+	"time"
+
+	"github.com/cenkalti/rpc2"
+	"github.com/ovn-kubernetes/libovsdb/ovsdb"
+	"github.com/ovn-kubernetes/libovsdb/ovsdb/serverdb"
+	"github.com/ovn-kubernetes/libovsdb/server"
+	"github.com/stretchr/testify/require"
+)
+
+// newServerWithConnections starts a server and returns, in addition to its
+// socket, a channel receiving the server side of every client connection, so
+// that a test can close a connection the way ovsdb-server does when it stops.
+func newServerWithConnections(t *testing.T) (*server.OvsdbServer, string, <-chan *rpc2.Client) {
+	t.Helper()
+	var defSchema ovsdb.DatabaseSchema
+	require.NoError(t, json.Unmarshal([]byte(schema), &defSchema))
+	s, sock := newOVSDBServer(t, defDB, defSchema)
+	conns := make(chan *rpc2.Client, 10)
+	s.OnConnect(func(c *rpc2.Client) { conns <- c })
+	return s, sock, conns
+}
+
+func nextServerConnection(t *testing.T, conns <-chan *rpc2.Client) *rpc2.Client {
+	t.Helper()
+	select {
+	case c := <-conns:
+		return c
+	case <-time.After(5 * time.Second):
+		t.Fatal("no client connection reached the server")
+		return nil
+	}
+}
+
+// connectServerDBClient returns a client connected to the _Server database.
+func connectServerDBClient(t *testing.T, sock string, opts ...Option) *ovsdbClient {
+	t.Helper()
+	serverDBModel, err := serverdb.FullDatabaseModel()
+	require.NoError(t, err)
+	ovs, err := newOVSDBClient(serverDBModel, append([]Option{WithEndpoint("unix:" + sock)}, opts...)...)
+	require.NoError(t, err)
+	require.NoError(t, ovs.Connect(context.Background()))
+	t.Cleanup(ovs.Close)
+	return ovs
+}
+
+// The disconnect handler waits for the other connection handlers. It must not
+// start waiting before they are added, or a server closing the connection
+// right away races with Connect.
+func TestServerClosingConnectionTearsDownClient(t *testing.T) {
+	_, sock, conns := newServerWithConnections(t)
+	ovs := connectServerDBClient(t, sock)
+
+	nextServerConnection(t, conns).Close()
+
+	require.Eventually(t, func() bool {
+		ovs.rpcMutex.RLock()
+		defer ovs.rpcMutex.RUnlock()
+		return ovs.rpcClient == nil
+	}, 5*time.Second, 10*time.Millisecond)
+}
