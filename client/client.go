@@ -92,6 +92,10 @@ type ovsdbClient struct {
 	connected bool
 	rpcClient *rpc2.Client
 	rpcMutex  sync.RWMutex
+
+	// gaveUpReconnecting is set, under rpcMutex, when reconnection failed
+	// for good: calls then fail right away until Connect succeeds again.
+	gaveUpReconnecting bool
 	// endpoints contains all possible endpoints; the first element is
 	// the active endpoint if connected=true
 	endpoints []*epInfo
@@ -335,6 +339,7 @@ func (o *ovsdbClient) connect(ctx context.Context, reconnect bool) error {
 	go o.handleDisconnectNotification()
 
 	o.connected = true
+	o.gaveUpReconnecting = false
 	return nil
 }
 
@@ -813,8 +818,9 @@ func (o *ovsdbClient) Transact(ctx context.Context, operation ...ovsdb.Operation
 	logger := o.logFromContext(ctx)
 	o.rpcMutex.RLock()
 	if o.rpcClient == nil || !o.connected {
+		awaitReconnection := o.options.reconnect && !o.gaveUpReconnecting
 		o.rpcMutex.RUnlock()
-		if o.options.reconnect {
+		if awaitReconnection {
 			logger.V(5).Info("blocking transaction until reconnected", "operations",
 				fmt.Sprintf("%+v", operation))
 			ticker := time.NewTicker(50 * time.Millisecond)
@@ -829,7 +835,11 @@ func (o *ovsdbClient) Transact(ctx context.Context, operation ...ovsdb.Operation
 					if o.rpcClient != nil && o.connected {
 						break ReconnectWaitLoop
 					}
+					gaveUp := o.gaveUpReconnecting
 					o.rpcMutex.RUnlock()
+					if gaveUp {
+						return nil, ErrNotConnected
+					}
 				}
 			}
 		} else {
@@ -1287,6 +1297,10 @@ func (o *ovsdbClient) handleDisconnectNotification() {
 			ctx, cancel := context.WithTimeout(context.Background(), o.options.timeout)
 			defer cancel()
 			err := o.connect(ctx, true)
+			if errors.Is(err, ErrAlreadyConnected) {
+				// Connect was called meanwhile and set up its own handlers.
+				return nil
+			}
 			if err != nil {
 				if suppressionCounter < 5 {
 					o.logger.V(2).Error(err, "failed to reconnect")
@@ -1300,13 +1314,16 @@ func (o *ovsdbClient) handleDisconnectNotification() {
 		}
 		o.logger.V(3).Info("connection lost, reconnecting", "endpoint", o.endpoints[0].address)
 		err := backoff.Retry(connect, o.options.backoff)
-		if err != nil {
-			// TODO: We should look at passing this back to the
-			// caller to handle
-			panic(err)
+		if err == nil {
+			// this goroutine finishes, and is replaced with a new one (from Connect)
+			return
 		}
-		// this goroutine finishes, and is replaced with a new one (from Connect)
-		return
+		// Reconnection failed for good. Instead of panicking, end up
+		// disconnected like a client without reconnect: the caller is
+		// notified and can call Connect again.
+		o.logger.Error(err, "failed to reconnect, giving up")
+		o.rpcMutex.Lock()
+		o.gaveUpReconnecting = true
 	}
 
 	// clear connection state

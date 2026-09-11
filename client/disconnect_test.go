@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cenkalti/backoff/v4"
 	"github.com/cenkalti/rpc2"
 	"github.com/ovn-kubernetes/libovsdb/ovsdb"
 	"github.com/ovn-kubernetes/libovsdb/ovsdb/serverdb"
@@ -121,4 +122,31 @@ func TestDisconnectNotificationIsKeptUntilReceived(t *testing.T) {
 		t.Fatal("the notification of the previous connection is pending on the new one")
 	default:
 	}
+}
+
+// When reconnection gives up, the client must neither panic nor keep calls
+// waiting for a reconnection that is not coming: it is disconnected, says so,
+// and fails calls until Connect is called again.
+func TestReconnectGivingUpLeavesClientDisconnected(t *testing.T) {
+	s, sock, conns := newServerWithConnections(t)
+	ovs := connectServerDBClient(t, sock,
+		WithReconnect(100*time.Millisecond, backoff.WithMaxRetries(&backoff.ZeroBackOff{}, 2)))
+
+	// Stop listening first, so that every reconnection attempt fails.
+	s.Close()
+	nextServerConnection(t, conns).Close()
+
+	select {
+	case <-ovs.DisconnectNotify():
+	case <-time.After(5 * time.Second):
+		t.Fatal("no disconnect notification after reconnection gave up")
+	}
+	require.False(t, ovs.Connected())
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	start := time.Now()
+	_, err := ovs.Transact(ctx, commentOperation())
+	require.ErrorIs(t, err, ErrNotConnected)
+	require.Less(t, time.Since(start), time.Second, "Transact waited for a reconnection that is not coming")
 }
